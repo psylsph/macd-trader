@@ -15,12 +15,12 @@ load_dotenv()
 
 def get_api_keys(args_api_key, args_secret_key):
     """Helper to get API keys from args or environment variables."""
-    api_key = args_api_key or os.getenv("ALPACA_API_KEY_ID")
-    secret_key = args_secret_key or os.getenv("ALPACA_API_SECRET_KEY")
+    api_key = args_api_key or os.getenv("APCA_API_KEY_ID")
+    secret_key = args_secret_key or os.getenv("APCA_API_SECRET_KEY")
 
     if not api_key or not secret_key:
         print("Error: API Key ID and Secret Key are required.")
-        print("Please set ALPACA_API_KEY_ID and ALPACA_API_SECRET_KEY environment variables,")
+        print("Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables,")
         print("or provide them via --api-key and --secret-key arguments.")
         return None, None
     return api_key, secret_key

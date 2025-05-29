@@ -5,6 +5,9 @@ import matplotlib.dates as mdates
 from backtesting import Backtest, Strategy
 from ta import trend as ta_trend
 from ta import volatility as ta_vol
+import warnings
+
+DEBUG = False
 
 def EMA_Backtesting(values, n):
     """
@@ -24,37 +27,39 @@ def ATR_Backtesting(data, window):
     return ta_vol.AverageTrueRange(high, low, close, window=window).average_true_range()
 
 class MACDStrategy(Strategy):
+
+    ema_window_size = 30
+    atr_window_size = 5
+    risk_reward = 1.1
+    signal_width = 12
+
     def init(self):
         close = self.data.Close
         # Calculate MACD components using exponential moving averages
         self.ema12 = self.I(EMA_Backtesting, close, 12)
         self.ema26 = self.I(EMA_Backtesting, close, 26)
-        self.ema50 = self.I(EMA_Backtesting, close, 50)
+        self.emaStop = self.I(EMA_Backtesting, close, self.ema_window_size)
         self.ema200 = self.I(EMA_Backtesting, close, 200)
         # Track buy/sell signals
         self.buy_signals = []
         self.sell_signals = []
         self.macd = self.ema12 - self.ema26
-        self.signal = self.I(EMA_Backtesting, self.macd, 9)
-        self.atr = self.I(ATR_Backtesting, self.data, 14)
+        self.signal = self.I(EMA_Backtesting, self.macd, self.signal_width)
+        self.atr = self.I(ATR_Backtesting, self.data, self.atr_window_size)
 
     def next(self):
-        # Only trade if we have enough data
-        if len(self.data) < 50:
-            return
-            
-      
+           
         # Buy when MACD crosses above signal line, both are below zero, price is above EMA200, and all EMAs are not trending down
         if (not self.position and
             self.macd[-1] > self.signal[-1] and
             self.macd[-1] < 0 and
             self.signal[-1] < 0 and
-            self.data.Close[-1] > self.ema200[-1] and
             self.ema12[-1] >= self.ema12[-2] and  # EMA12 not trending down
             self.ema26[-1] >= self.ema26[-2] and  # EMA26 not trending down
-            self.ema50[-1] >= self.ema50[-2] and  # EMA50 not trending down
-            self.ema200[-1] >= self.ema200[-2]):  # EMA200 not trending down
-            print("BUY SIGNAL")
+            self.emaStop[-1] >= self.emaStop[-2] and # emaStop not trending down
+            self.signal[-1] >= self.signal[-2]):  # Signal not trending down
+            if DEBUG:
+                print("BUY SIGNAL")
             self.buy_signals.append((self.data.index[-1], self.data.Close[-1]))
             self.buy(size=0.5, sl=self.data.Close[-1] - 2*self.atr[-1])
             
@@ -67,17 +72,15 @@ class MACDStrategy(Strategy):
             if self.position.is_long:
                 if self.macd[-1] < self.signal[-1]:
                     exit_reason = "MACD crossover below signal"
-                # elif self.macd[-1] > 0:
-                #     exit_reason = "MACD above zero (overbought)"
-                elif self.data.Close[-1] < self.ema50[-1]:
-                    exit_reason = "Price below EMA50"
-                # Simplified EMA50-based stop loss and take profit
+                elif self.data.Close[-1] < self.emaStop[-1]:
+                    exit_reason = "Price below emaStop"
+                # Simplified emaStop-based stop loss and take profit
                 entry_price = self.position.pl + self.data.Close[-1]
-                sl_price = self.ema50[-1]
-                tp_price = entry_price + 1.5*(entry_price - sl_price)  # 1.5:1 reward:risk
+                sl_price = self.emaStop[-1]
+                tp_price = entry_price + self.risk_reward*(entry_price - sl_price)
                 
                 if self.data.Close[-1] < sl_price:
-                    exit_reason = "EMA50 stop loss triggered"
+                    exit_reason = "emaStop stop loss triggered"
                 elif self.data.Close[-1] > tp_price:
                     exit_reason = "Take profit target reached"
             
@@ -104,32 +107,29 @@ class MACDStrategy(Strategy):
             
             # Close position if any exit condition met
             if exit_reason:
-                print(f"CLOSING {'LONG' if self.position.is_long else 'SHORT'} POSITION: {exit_reason}")
+                if DEBUG:
+                    print(f"CLOSING {'LONG' if self.position.is_long else 'SHORT'} POSITION: {exit_reason}")
                 self.sell_signals.append((self.data.index[-1], self.data.Close[-1]))
                 self.position.close()
 
 
+def plot_macd(data, equity=None, buy_signals=None, sell_signals=None):
+    """Plot close price, MACD indicator and equity curve"""
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 
-def calculate_macd(data, short_window=12, long_window=26, signal_window=9):
-    """Calculate MACD indicator"""
+    # Calculate EMA12 and EMA26 for plotting
     data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
     data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
-    data['EMA50'] = data['Close'].ewm(span=50, adjust=False).mean()
     data['EMA200'] = data['Close'].ewm(span=200, adjust=False).mean()
     data['MACD'] = data['EMA12'] - data['EMA26']
     data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
     data['Histogram'] = data['MACD'] - data['Signal']
-    return data
 
-def plot_macd(data, equity=None, buy_signals=None, sell_signals=None):
-    """Plot close price, MACD indicator and equity curve"""
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     
     # Plot price and EMAs
     ax1.plot(data.index, data['Close'], label='Close Price', color='blue')
     ax1.plot(data.index, data['EMA12'], label='EMA 12', color='orange', alpha=0.5)
     ax1.plot(data.index, data['EMA26'], label='EMA 26', color='purple', alpha=0.5)
-    ax1.plot(data.index, data['EMA50'], label='EMA 50', color='green', alpha=0.7)
     ax1.plot(data.index, data['EMA200'], label='EMA 200', color='red', alpha=0.7)
     
     # Plot buy/sell signals if provided
@@ -167,7 +167,7 @@ def plot_macd(data, equity=None, buy_signals=None, sell_signals=None):
     plt.xticks(rotation=45)
     # Plot equity curve if provided
     if equity is not None:
-        ax3.plot(equity.index, equity['Equity'], label='Equity', color='blue')
+        ax3.plot(equity.index, equity, label='Equity', color='blue')
         ax3.set_ylabel('Equity ($)')
         ax3.legend()
         ax3.grid(True)
@@ -176,26 +176,27 @@ def plot_macd(data, equity=None, buy_signals=None, sell_signals=None):
     plt.show()
 
 if __name__ == "__main__":
+    
     # Load data and prepare for backtesting
     data = pd.read_csv('data.csv', parse_dates=['timestamp'])
     data = data.set_index('timestamp')
-    data.index = pd.to_datetime(data.index)
     data = data.rename(columns={'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'})
-    data = calculate_macd(data)
-    bt = Backtest(data, MACDStrategy, cash=10000, commission=.002,
-                exclusive_orders=True)
+    bt = Backtest(data, MACDStrategy, cash=10000, commission=.002, margin=0.9,
+                exclusive_orders=False, finalize_trades=True)
     stats = bt.run()
-    print(stats)
-    #bt.plot()
-    
-    # Plot results with equity curve and signals
-    equity = pd.DataFrame({
-        'Equity': stats['_equity_curve']['Equity']
-    }, index=data.index[:len(stats['_equity_curve'])])
-    
-    # Get strategy instance from backtest results
-    strategy_instance = stats['_strategy']
-    plot_macd(data,
-             equity=equity,
-             buy_signals=strategy_instance.buy_signals,
-             sell_signals=strategy_instance.sell_signals)
+    #stats = bt.optimize(ema_window_size=range(30, 75), atr_window_size=range(5, 15),
+    #                    risk_reward=[1.1, 1.2, 1.3, 1.4, 1.5], signal_width=range(5,16), maximize='Equity Final [$]')
+    print("\n--- Backtest Statistics (Best Run) ---")
+    print(stats) # Prints the main statistics Series for the best run
+
+    # Access and print the best parameters from the strategy object
+    best_strategy = stats._strategy
+    print("\n--- Optimal Parameters Found ---")
+    print(f"ema_window_size: {best_strategy.ema_window_size}")
+    print(f"atr_window_size: {best_strategy.atr_window_size}")
+    print(f"risk_reward: {best_strategy.risk_reward}")
+    print(f"signal_width: {best_strategy.signal_width}")
+    # Add any other parameters you might optimize in the future here
+    warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
+    warnings.filterwarnings("ignore", message="Superimposed OHLC plot matches the original plot. Skipping.")
+    bt.plot()
