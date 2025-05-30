@@ -7,6 +7,7 @@ from alpaca.data.live import CryptoDataStream
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 import logging
+import keyboard  # For keyboard input monitoring
 from ta import trend as ta_trend
 from ta import volatility as ta_vol
 
@@ -40,6 +41,8 @@ class LiveMACDStrategy:
         self.atr_window_size = 5
         self.risk_reward = 1.1
         self.signal_width = 12
+        self.last_trade_time = None
+        self.min_trade_interval = 14400  # Minimum 4 hours between trades (in seconds)
 
     def update_indicators(self):
         """Calculate and update technical indicators"""
@@ -98,6 +101,11 @@ class LiveMACDStrategy:
     def check_entry_signals(self):
         """Check for entry opportunities"""
         try:
+            # Check if enough time has passed since last trade
+            if self.last_trade_time and (pd.Timestamp.now() - self.last_trade_time).total_seconds() < self.min_trade_interval:
+                logger.debug(f"Skipping entry - minimum {self.min_trade_interval//3600} hour trade interval not met")
+                return
+                
             # Buy when MACD crosses above signal line, both are below zero, price is above EMA200
             if (self.macd.iloc[-1] > self.signal.iloc[-1] and
                 self.macd.iloc[-1] < 0 and
@@ -105,6 +113,7 @@ class LiveMACDStrategy:
                 self.bars['close'].iloc[-1] > self.ema200.iloc[-1]):
                 
                 self.enter_position(OrderSide.BUY)
+                self.last_trade_time = pd.Timestamp.now()
                 
         except Exception as e:
             logger.error(f"Entry signal error: {str(e)}")
@@ -116,9 +125,18 @@ class LiveMACDStrategy:
             
             # Exit long positions
             if position and position.side == OrderSide.BUY:
+                entry_price = float(position.entry_price)
+                current_price = self.bars['close'].iloc[-1]
+                sl_price = self.emaStop.iloc[-1]
+                tp_price = entry_price + self.risk_reward * (entry_price - sl_price)
+                
                 if self.macd.iloc[-1] < self.signal.iloc[-1]:
                     exit_reason = "MACD crossover below signal"
-                elif self.bars['close'].iloc[-1] < self.emaStop.iloc[-1]:
+                elif current_price < sl_price:
+                    exit_reason = "Stop loss triggered"
+                elif current_price > tp_price:
+                    exit_reason = "Take profit target reached"
+                elif current_price < self.emaStop.iloc[-1]:
                     exit_reason = "Price below emaStop"
                     
             if exit_reason:
@@ -127,12 +145,43 @@ class LiveMACDStrategy:
         except Exception as e:
             logger.error(f"Exit signal error: {str(e)}")
 
+    def get_available_funds(self) -> float:
+        """Get available trading funds in USD"""
+        try:
+            # Get account info without explicit type import
+            account = self.trading_client.get_account()
+            if not account or not hasattr(account, 'cash'):
+                logger.error("No valid account information available")
+                return 0.0
+                
+            cash_str = getattr(account, 'cash', '0')
+            if not cash_str:
+                logger.error("No cash balance available")
+                return 0.0
+                
+            try:
+                return float(cash_str)
+            except (ValueError, TypeError) as e:
+                logger.error(f"Invalid cash value '{cash_str}': {str(e)}")
+                return 0.0
+                
+        except Exception as e:
+            logger.error(f"Error getting account balance: {str(e)}")
+            return 0.0
+
     def enter_position(self, side: OrderSide):
         """Enter new position with risk management"""
         try:
             current_price = self.bars['close'].iloc[-1]
             qty = 0.1  # Fixed position size for example
+            required_funds = current_price * qty
             
+            # Check available funds
+            available_funds = self.get_available_funds()
+            if available_funds < required_funds:
+                logger.warning(f"Insufficient funds for {side} order (required: {required_funds:.2f}, available: {available_funds:.2f})")
+                return
+                
             order_data = MarketOrderRequest(
                 symbol=self.symbol,
                 qty=qty,
@@ -185,9 +234,13 @@ class LiveMACDStrategy:
             # Run stream in background
             self.stream_task = asyncio.create_task(self._run_stream())
             
-            # Keep strategy running
+            # Keep strategy running until 'x' is pressed
+            logger.info("Press 'x' to stop trading...")
             while True:
-                await asyncio.sleep(1)
+                if keyboard.is_pressed('x'):
+                    logger.info("Stopping trading...")
+                    break
+                await asyncio.sleep(0.1)
                 
         except Exception as e:
             logger.error(f"Strategy error: {str(e)}")

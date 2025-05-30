@@ -70,16 +70,13 @@ class MACDStrategy(Strategy):
             
             # Check exit conditions for long positions
             if self.position.is_long:
-                if self.macd[-1] < self.signal[-1]:
-                    exit_reason = "MACD crossover below signal"
-                elif self.data.Close[-1] < self.emaStop[-1]:
-                    exit_reason = "Price below emaStop"
                 # Simplified emaStop-based stop loss and take profit
                 entry_price = self.position.pl + self.data.Close[-1]
                 sl_price = self.emaStop[-1]
                 tp_price = entry_price + self.risk_reward*(entry_price - sl_price)
-                
-                if self.data.Close[-1] < sl_price:
+                if self.macd[-1] < self.signal[-1]:
+                    exit_reason = "MACD crossover below signal"
+                elif self.data.Close[-1] < sl_price:
                     exit_reason = "emaStop stop loss triggered"
                 elif self.data.Close[-1] > tp_price:
                     exit_reason = "Take profit target reached"
