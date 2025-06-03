@@ -1,9 +1,6 @@
+from ast import And
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import backtrader as bt
-from ta import trend as ta_trend
-from ta import volatility as ta_vol
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="ta.trend")
@@ -15,14 +12,9 @@ class MACDStrategy(bt.Strategy):
     params = (
         ('symbol', 'ETHUSD'),
         ('interval', 1),
-        ('ema_stop_window_size', 30),
         ('atr_window_size', 6),
-        ('risk_reward', 1.1),
         ('signal_width', 14),
-        ('max_buy_per_24h', 1),
-        ('macd_offset', 3),
-        ('signal_offset', 0),
-        # Removed duplicate 'signal_width'
+        ('cooldown_bars', 24),  # Number of bars to wait after a sell before buying again
         ('macd_fast', 12),
         ('macd_slow', 26),
         ('macd_signal', 9))
@@ -35,6 +27,8 @@ class MACDStrategy(bt.Strategy):
         self.sell_signal = None
         self.buy_signals = []
         self.sell_signals = []
+        self.last_sell_bar = 0  # Track the bar number of last sell
+        self.bar_count = 0  # Track total bars seen
 
         # Initialize buy/sell signal prices to track executed prices
         self.buy_signal_price = None
@@ -54,6 +48,7 @@ class MACDStrategy(bt.Strategy):
         self.macd_line = self.ema_fast - self.ema_slow
         self.signal_line = bt.ind.EMA(self.macd_line, period=self.p.macd_signal)
         self.ema200 = bt.ind.EMA(self.data0, period=200)
+        self.rsi = bt.ind.RSI(self.data0, period=30)
 
         # Create ATR
         self.atr = bt.ind.ATR(self.data0, period=self.p.signal_width)
@@ -62,7 +57,7 @@ class MACDStrategy(bt.Strategy):
         # Set minimum period required
         minperiod = max(200, 26 + 9)
         self.addminperiod(minperiod)
-        print(f"✓ Minimum period set to {minperiod}")
+        print(f"Minimum period set to {minperiod}")
         
         print("\nAll indicators initialized successfully")
         
@@ -74,24 +69,33 @@ class MACDStrategy(bt.Strategy):
         # Get current datetime
         current_dt = self.data.datetime.datetime(-1)
         current_close = self.dataclose[-1]
-        #print(f"\nProcessing bar at {current_dt}: Close={current_close:.2f}")
-        #print(f"\nProcessing bar at {current_dt}: self.ema_fast[-1]={self.ema_fast[-1]:.2f}, self.ema_slow[-1]={self.ema_slow[-1]:.2f}")
-        #print(f"\nProcessing bar at {current_dt}: self.macd_line[-1]={self.macd_line[-1]:.2f}")
+        self.bar_count += 1  # Increment bar counter
+
+        # Check if we're still in cooldown period
+        bars_since_last_sell = self.bar_count - self.last_sell_bar
         
         if (not self.position and
             self.ema_fast[-1] > self.ema_slow[-1] and
             #self.macd_line[-1] < 0 and
-            self.dataclose[-1] > self.ema200[-1]
+            self.dataclose[-1] > self.ema200[-1] and
+            self.ema_slow[-2] < self.ema_slow[-1] and
+            self.ema_fast[-2] < self.ema_fast[-1] and
+            self.ema200[-2] < self.ema200[-1]
         ):
 
             if DEBUG:
-                print(f"\nProcessing bar at {current_dt}: Close={current_close:.2f}")
-                print(">>> BUY SIGNAL TRIGGERED <<<")
+                print("\n>>> BUY SIGNAL TRIGGERED <<<")
+                print(f"Processing bar at {current_dt}: Close={current_close:.2f}")
                 print(f"Entry Price: {current_close:.2f}")
+                if bars_since_last_sell < self.p.cooldown_bars:
+                    print(f"Buy Stopped in Cooldown")
+                    return
+
             self.buy_signals.append((current_dt, current_close))
             self.buy_timestamps.append(current_dt)
             self.position_openings.append((current_dt, current_close, 'long'))
-            self.buy(size=0.5, sl=self.dataclose[-1] - 2*self.atr[-1])
+            #self.buy(size=0.5, sl=self.dataclose[-1] - 2*self.atr[-1])
+            self.buy(size=0.5, sl=current_close)
             
         # Only proceed with position closing logic if we actually have an open position
         if hasattr(self, 'position') and self.position:
@@ -105,17 +109,32 @@ class MACDStrategy(bt.Strategy):
                     exit_reason = "Take profit target reached"
                 elif self.ema_fast[-1] < self.ema_slow[-1]:  # Fast below Slow
                     exit_reason = "Fast below Slow"
+                    self.last_sell_bar = self.bar_count  # Record the sell bar
                 elif self.dataclose[-1] < self.ema200[-1]:  # Stop loss
                     exit_reason = "ema200 stop loss triggered"
+                    self.last_sell_bar = self.bar_count  # Record the sell bar
+                elif self.ema_fast[-2] > self.ema_fast[-1]:  # Fast above Fast
+                    exit_reason = "Fast dropping"
+                    self.last_sell_bar = self.bar_count
            
            
                 # Close position if any exit condition met
                 if exit_reason:
                     if DEBUG:
+                        print(">>> SELL SIGNAL TRIGGERED <<<")
+                        print(f"Processing bar at {current_dt}: Close={current_close:.2f}")
                         print(f"CLOSING POSITION: {exit_reason} on {self.data.datetime.datetime(-1).strftime('%m/%d/%Y')}")
                         print(f"Exit Price: {self.dataclose[-1]:.2f}")
                     self.sell_signals.append((current_dt, current_close))
+                    if DEBUG:
+                        print(f"Starting cooldown period of {self.p.cooldown_bars} bars")
                     self.close()
+def stop(self):
+        # Close any open position at the end of the backtest
+        if self.position:
+            if DEBUG:
+                print("Closing last open position at end of backtest")
+            self.close()
 
 if __name__ == "__main__":
     
@@ -144,16 +163,15 @@ if __name__ == "__main__":
 
     # Configure the broker settings
     cerebro.broker.set_cash(10000)
-    cerebro.broker.setcommission(commission=0.0025)
+    cerebro.broker.setcommission(commission=0.002)
     
     # Add analyzers to evaluate strategy performance
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    #cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     #cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
 
-    # Add observers to plot buy/sell signals and portfolio changes
-    cerebro.addobserver(bt.observers.BuySell)
-    #cerebro.addobserver(bt.observers.Broker)
+    # Add observers to plot buy/sell signals, portfolio changes, and close price
+    #cerebro.addobserver(bt.observers.BuySell)
 
     # Run the strategy
     # Run backtest with performance reporting
