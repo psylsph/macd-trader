@@ -68,7 +68,7 @@ def process_and_save_data(bars_response, symbol, output_file):
     else:
         bars_df = bars_df.reset_index() # 'timestamp' is usually the index
 
-    print(f"\nSuccessfully fetched {len(bars_df)} 1-day bars for {symbol}:")
+    print(f"\nSuccessfully fetched {len(bars_df)} bars for {symbol}:")
     print(bars_df.head())
     print("...")
     print(bars_df.tail())
@@ -108,20 +108,21 @@ def download_stock_hourly_data(api_key: str,
         print(f"An unexpected error occurred (Stock): {e}")
 
 
-def download_crypto_daily_data(api_key: str,
+def download_crypto_data(api_key: str,
                                 secret_key: str,
                                 symbol: str, # e.g., "BTC/USD"
                                 start_dt: datetime,
                                 end_dt: datetime,
+                                time_frame: TimeFrame,
                                 output_file = None):
     """Downloads 1-hour historical crypto data from Alpaca."""
     client = CryptoHistoricalDataClient(api_key, secret_key)
-    print(f"Fetching 1-day CRYPTO data for {symbol} from {start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
+    print(f"Fetching 1-hour CRYPTO data for {symbol} from {start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
 
     # Crypto symbols are often pairs like "BTC/USD". The API expects them as is.
     request_params = CryptoBarsRequest(
         symbol_or_symbols=symbol.upper(), # Ensure uppercase, e.g., BTC/USD
-        timeframe=TimeFrame.Day,
+        timeframe=time_frame,
         start=start_dt,
         end=end_dt
         # No 'adjustment' parameter for crypto
@@ -175,12 +176,13 @@ def main():
         if '/' not in args.symbol:
             print("Warning: Crypto symbol might be incorrect. Expected format like 'BTC/USD' or 'ETH/EUR'.")
             # Consider adding more robust validation or transformation if needed
-        download_crypto_daily_data(
+        download_crypto_data(
             api_key=api_key,
             secret_key=secret_key,
             symbol=args.symbol, # Pass as is, e.g., "BTC/USD"
             start_dt=start_dt,
             end_dt=end_dt,
+            time_frame=TimeFrame(1, TimeFrameUnit.Hour),
             output_file=args.output_file
         )
     else:

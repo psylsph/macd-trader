@@ -5,6 +5,6 @@ pytz>=2023.3
 alpaca-py>=0.10.0
 python-dotenv>=1.0.0
 matplotlib>=3.7.0
-backtesting
+backtrader
 ta
 keyboard

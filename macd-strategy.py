@@ -1,199 +1,185 @@
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from backtesting import Backtest, Strategy
+import backtrader as bt
 from ta import trend as ta_trend
 from ta import volatility as ta_vol
 import warnings
 
-DEBUG = False
+warnings.filterwarnings("ignore", category=FutureWarning, module="ta.trend")
 
-def EMA_Backtesting(values, n):
-    """
-    Return exponential moving average of `values`, at
-    each step taking into account `n` previous values.
-    """
-    close = pd.Series(values)
-    return ta_trend.EMAIndicator(close, window=n).ema_indicator()
+DEBUG = True
 
-def ATR_Backtesting(data, window):
-    """
-    Calculate the Average True Range (ATR) for the given data.
-    """
-    high = pd.Series(data.High)
-    low = pd.Series(data.Low)
-    close = pd.Series(data.Close)
-    return ta_vol.AverageTrueRange(high, low, close, window=window).average_true_range()
+class MACDStrategy(bt.Strategy):
 
-class MACDStrategy(Strategy):
+    params = (
+        ('symbol', 'ETHUSD'),
+        ('interval', 1),
+        ('ema_stop_window_size', 30),
+        ('atr_window_size', 6),
+        ('risk_reward', 1.1),
+        ('signal_width', 14),
+        ('max_buy_per_24h', 1),
+        ('macd_offset', 3),
+        ('signal_offset', 0),
+        # Removed duplicate 'signal_width'
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9))
 
-    ema_window_size = 30
-    atr_window_size = 5
-    risk_reward = 1.1
-    signal_width = 12
+    def __init__(self):
 
-    def init(self):
-        close = self.data.Close
-        # Calculate MACD components using exponential moving averages
-        self.ema12 = self.I(EMA_Backtesting, close, 12)
-        self.ema26 = self.I(EMA_Backtesting, close, 26)
-        self.emaStop = self.I(EMA_Backtesting, close, self.ema_window_size)
-        self.ema200 = self.I(EMA_Backtesting, close, 200)
-        # Track buy/sell signals
+        self.signals = None
+        self.order = None
+        self.buy_signal = None
+        self.sell_signal = None
         self.buy_signals = []
         self.sell_signals = []
-        self.macd = self.ema12 - self.ema26
-        self.signal = self.I(EMA_Backtesting, self.macd, self.signal_width)
-        self.atr = self.I(ATR_Backtesting, self.data, self.atr_window_size)
+
+        # Initialize buy/sell signal prices to track executed prices
+        self.buy_signal_price = None
+        self.sell_signal_price = None
+
+        # Store data reference
+        self.dataclose = self.data0.close
+        
+        print("\nInitializing strategy indicators...")
+        
+        # Create MACD with histogram
+        self.macd = bt.ind.MACDHisto()
+        
+        # Create moving averages
+        self.ema_fast = bt.ind.EMA(self.data0, period=self.p.macd_fast)
+        self.ema_slow = bt.ind.EMA(self.data0, period=self.p.macd_slow)
+        self.macd_line = self.ema_fast - self.ema_slow
+        self.signal_line = bt.ind.EMA(self.macd_line, period=self.p.macd_signal)
+        self.ema200 = bt.ind.EMA(self.data0, period=200)
+
+        # Create ATR
+        self.atr = bt.ind.ATR(self.data0, period=self.p.signal_width)
+
+        
+        # Set minimum period required
+        minperiod = max(200, 26 + 9)
+        self.addminperiod(minperiod)
+        print(f"✓ Minimum period set to {minperiod}")
+        
+        print("\nAll indicators initialized successfully")
+        
+        # Track buy/sell signals
+        self.buy_timestamps = []
+        self.position_openings = []
 
     def next(self):
-           
-        # Buy when MACD crosses above signal line, both are below zero, price is above EMA200, and all EMAs are not trending down
+        # Get current datetime
+        current_dt = self.data.datetime.datetime(-1)
+        current_close = self.dataclose[-1]
+        #print(f"\nProcessing bar at {current_dt}: Close={current_close:.2f}")
+        #print(f"\nProcessing bar at {current_dt}: self.ema_fast[-1]={self.ema_fast[-1]:.2f}, self.ema_slow[-1]={self.ema_slow[-1]:.2f}")
+        #print(f"\nProcessing bar at {current_dt}: self.macd_line[-1]={self.macd_line[-1]:.2f}")
+        
         if (not self.position and
-            self.macd[-1] > self.signal[-1] and
-            self.macd[-1] < 0 and
-            self.signal[-1] < 0 and
-            self.ema12[-1] >= self.ema12[-2] and  # EMA12 not trending down
-            self.ema26[-1] >= self.ema26[-2] and  # EMA26 not trending down
-            self.emaStop[-1] >= self.emaStop[-2] and # emaStop not trending down
-            self.signal[-1] >= self.signal[-2]):  # Signal not trending down
+            self.ema_fast[-1] > self.ema_slow[-1] and
+            #self.macd_line[-1] < 0 and
+            self.dataclose[-1] > self.ema200[-1]
+        ):
+
             if DEBUG:
-                print("BUY SIGNAL")
-            self.buy_signals.append((self.data.index[-1], self.data.Close[-1]))
-            self.buy(size=0.5, sl=self.data.Close[-1] - 2*self.atr[-1])
+                print(f"\nProcessing bar at {current_dt}: Close={current_close:.2f}")
+                print(">>> BUY SIGNAL TRIGGERED <<<")
+                print(f"Entry Price: {current_close:.2f}")
+            self.buy_signals.append((current_dt, current_close))
+            self.buy_timestamps.append(current_dt)
+            self.position_openings.append((current_dt, current_close, 'long'))
+            self.buy(size=0.5, sl=self.dataclose[-1] - 2*self.atr[-1])
             
-        # Consolidated position closing logic
-        if self.position:
+        # Only proceed with position closing logic if we actually have an open position
+        if hasattr(self, 'position') and self.position:
             exit_reason = None
-            sl_price = None
             
             # Check exit conditions for long positions
-            if self.position.is_long:
-                # Simplified emaStop-based stop loss and take profit
-                entry_price = self.position.pl + self.data.Close[-1]
-                sl_price = self.emaStop[-1]
-                tp_price = entry_price + self.risk_reward*(entry_price - sl_price)
-                if self.macd[-1] < self.signal[-1]:
-                    exit_reason = "MACD crossover below signal"
-                elif self.data.Close[-1] < sl_price:
-                    exit_reason = "emaStop stop loss triggered"
-                elif self.data.Close[-1] > tp_price:
+            if self.position:
+                entry_price = self.position.price
+                tp_price = entry_price*1.05
+                if self.dataclose[-1] > tp_price:
                     exit_reason = "Take profit target reached"
-            
-            # Check exit conditions for short positions
-            elif self.position.is_short:
-                if self.macd[-1] > self.signal[-1]:
-                    exit_reason = "MACD crossover above signal"
-                elif self.macd[-1] < 0:
-                    exit_reason = "MACD below zero (oversold)"
-                elif self.data.Close[-1] > self.ema200[-1]:
-                    exit_reason = "Price above EMA200"
-                # Enhanced stop loss logic
-                entry_price = self.position.pl + self.data.Close[-1]
-                if self.data.Close[-1] > self.ema200[-1]:
-                    # Above EMA200 - use tighter stop loss
-                    sl_price = max(entry_price + 1*self.atr[-1], self.ema200[-1])
-                    if self.data.Close[-1] > sl_price:
-                        exit_reason = "EMA200 zone stop loss triggered"
-                else:
-                    # Below EMA200 - normal stop loss
-                    sl_price = entry_price + 2*self.atr[-1]
-                    if self.data.Close[-1] > sl_price:
-                        exit_reason = "ATR stop loss triggered"
-            
-            # Close position if any exit condition met
-            if exit_reason:
-                if DEBUG:
-                    print(f"CLOSING {'LONG' if self.position.is_long else 'SHORT'} POSITION: {exit_reason}")
-                self.sell_signals.append((self.data.index[-1], self.data.Close[-1]))
-                self.position.close()
-
-
-def plot_macd(data, equity=None, buy_signals=None, sell_signals=None):
-    """Plot close price, MACD indicator and equity curve"""
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-
-    # Calculate EMA12 and EMA26 for plotting
-    data['EMA12'] = data['Close'].ewm(span=12, adjust=False).mean()
-    data['EMA26'] = data['Close'].ewm(span=26, adjust=False).mean()
-    data['EMA200'] = data['Close'].ewm(span=200, adjust=False).mean()
-    data['MACD'] = data['EMA12'] - data['EMA26']
-    data['Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-    data['Histogram'] = data['MACD'] - data['Signal']
-
-    
-    # Plot price and EMAs
-    ax1.plot(data.index, data['Close'], label='Close Price', color='blue')
-    ax1.plot(data.index, data['EMA12'], label='EMA 12', color='orange', alpha=0.5)
-    ax1.plot(data.index, data['EMA26'], label='EMA 26', color='purple', alpha=0.5)
-    ax1.plot(data.index, data['EMA200'], label='EMA 200', color='red', alpha=0.7)
-    
-    # Plot buy/sell signals if provided
-    if buy_signals:
-        dates, prices = zip(*buy_signals)
-        ax1.scatter(dates, prices, color='green', marker='^',
-                   label='Buy Signals', alpha=0.7, s=100)
-    if sell_signals:
-        dates, prices = zip(*sell_signals)
-        ax1.scatter(dates, prices, color='red', marker='v',
-                   label='Sell Signals', alpha=0.7, s=100)
-    
-    ax1.set_ylabel('Price')
-    ax1.legend()
-    ax1.grid(True)
-    
-    # Plot MACD components
-    ax2.plot(data.index, data['MACD'], label='MACD', color='blue')
-    ax2.plot(data.index, data['Signal'], label='Signal Line', color='orange')
-    ax2.axhline(0, color='gray', linestyle='--', alpha=0.5)  # Zero line
-    
-    # Plot histogram with color based on value
-    pos_mask = data['Histogram'] > 0
-    neg_mask = data['Histogram'] < 0
-    ax2.bar(data.index[pos_mask], data['Histogram'][pos_mask],
-            color='green', width=0.8, label='Bullish')
-    ax2.bar(data.index[neg_mask], data['Histogram'][neg_mask],
-            color='red', width=0.8, label='Bearish')
-    ax2.set_ylabel('MACD')
-    ax2.legend()
-    ax2.grid(True)
-    
-    # Format x-axis
-    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.xticks(rotation=45)
-    # Plot equity curve if provided
-    if equity is not None:
-        ax3.plot(equity.index, equity, label='Equity', color='blue')
-        ax3.set_ylabel('Equity ($)')
-        ax3.legend()
-        ax3.grid(True)
-    
-    plt.tight_layout()
-    plt.show()
+                elif self.ema_fast[-1] < self.ema_slow[-1]:  # Fast below Slow
+                    exit_reason = "Fast below Slow"
+                elif self.dataclose[-1] < self.ema200[-1]:  # Stop loss
+                    exit_reason = "ema200 stop loss triggered"
+           
+           
+                # Close position if any exit condition met
+                if exit_reason:
+                    if DEBUG:
+                        print(f"CLOSING POSITION: {exit_reason} on {self.data.datetime.datetime(-1).strftime('%m/%d/%Y')}")
+                        print(f"Exit Price: {self.dataclose[-1]:.2f}")
+                    self.sell_signals.append((current_dt, current_close))
+                    self.close()
 
 if __name__ == "__main__":
     
-    # Load data and prepare for backtesting
-    data = pd.read_csv('data.csv', parse_dates=['timestamp'])
-    data = data.set_index('timestamp')
-    data = data.rename(columns={'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'})
-    bt = Backtest(data, MACDStrategy, cash=10000, commission=.002, margin=0.9,
-                exclusive_orders=False, finalize_trades=True)
-    stats = bt.run()
-    #stats = bt.optimize(ema_window_size=range(30, 75), atr_window_size=range(5, 15),
-    #                    risk_reward=[1.1, 1.2, 1.3, 1.4, 1.5], signal_width=range(5,16), maximize='Equity Final [$]')
-    print("\n--- Backtest Statistics (Best Run) ---")
-    print(stats) # Prints the main statistics Series for the best run
+    # Initialize Cerebro engine
+    cerebro = bt.Cerebro()
 
-    # Access and print the best parameters from the strategy object
-    best_strategy = stats._strategy
-    print("\n--- Optimal Parameters Found ---")
-    print(f"ema_window_size: {best_strategy.ema_window_size}")
-    print(f"atr_window_size: {best_strategy.atr_window_size}")
-    print(f"risk_reward: {best_strategy.risk_reward}")
-    print(f"signal_width: {best_strategy.signal_width}")
-    # Add any other parameters you might optimize in the future here
-    warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
-    warnings.filterwarnings("ignore", message="Superimposed OHLC plot matches the original plot. Skipping.")
-    bt.plot()
+    # Add strategy to Cerebro
+    cerebro.addstrategy(MACDStrategy)
+
+    # Load Data (example CSV file with timestamp, open, high, low, close, volume columns)
+    data = pd.read_csv('data.csv', parse_dates=['timestamp'])
+    data.set_index('timestamp', inplace=True)
+    data = data.rename(columns={'close': 'Close', 'open': 'Open', 'high': 'High', 'low': 'Low', 'volume': 'Volume'})
+    # Create and add data feed
+    data_feed = bt.feeds.PandasDirectData(
+        dataname=data,
+        datetime=0,  # Auto-detect from index
+        open=1,      # Use column index for OHLCV
+        high=2,
+        low=3,
+        close=4,
+        volume=5,
+        openinterest=-1  # No open interest data
+    )
+    cerebro.adddata(data_feed)
+
+    # Configure the broker settings
+    cerebro.broker.set_cash(10000)
+    cerebro.broker.setcommission(commission=0.0025)
+    
+    # Add analyzers to evaluate strategy performance
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe_ratio')
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+    #cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trade_analyzer')
+
+    # Add observers to plot buy/sell signals and portfolio changes
+    cerebro.addobserver(bt.observers.BuySell)
+    #cerebro.addobserver(bt.observers.Broker)
+
+    # Run the strategy
+    # Run backtest with performance reporting
+    initial_value = cerebro.broker.getvalue()
+    print(f"\nStarting Backtest:")
+    print(f"Initial Portfolio Value: ${initial_value:.2f}")
+    
+    try:
+        results = cerebro.run()
+        
+        final_value = cerebro.broker.getvalue()
+        abs_return = final_value - initial_value
+        pct_return = (abs_return / initial_value) * 100
+        
+        print("\nBacktest Results:")
+        print(f"Final Portfolio Value: ${final_value:.2f}")
+        print(f"Absolute Return: ${abs_return:.2f}")
+        print(f"Percentage Return: {pct_return:.1f}%")
+        
+    except Exception as e:
+        print(f"\nBacktest failed: {str(e)}")
+        raise
+    final_value = cerebro.broker.get_value()
+    print(f"Final Portfolio Value: {final_value}")
+
+    # Plot the results (including buy/sell signals and portfolio changes)
+    cerebro.plot(style='candlestick')
+
+

@@ -37,12 +37,15 @@ class LiveMACDStrategy:
         self.trading_client = TradingClient(API_KEY, SECRET_KEY, paper=paper)
         self.bars = pd.DataFrame()
         self.positions = []
-        self.ema_window_size = 30
-        self.atr_window_size = 5
+        self.ema_stop_window_size = 30
+        self.atr_window_size = 6
         self.risk_reward = 1.1
-        self.signal_width = 12
-        self.last_trade_time = None
-        self.min_trade_interval = 14400  # Minimum 4 hours between trades (in seconds)
+        self.signal_width = 14
+        self.max_buy_per_24h = 1
+        self.macd_offset = 3
+        self.signal_offset = 3
+        self.buy_timestamps = []
+        self.close_timestamps = []
 
     def update_indicators(self):
         """Calculate and update technical indicators"""
@@ -52,7 +55,7 @@ class LiveMACDStrategy:
         close = self.bars['close']
         self.ema12 = ta_trend.EMAIndicator(close, window=12).ema_indicator()
         self.ema26 = ta_trend.EMAIndicator(close, window=26).ema_indicator()
-        self.emaStop = ta_trend.EMAIndicator(close, window=self.ema_window_size).ema_indicator()
+        self.emaStop = ta_trend.EMAIndicator(close, window=self.ema_stop_window_size).ema_indicator()
         self.ema200 = ta_trend.EMAIndicator(close, window=200).ema_indicator()
         self.macd = self.ema12 - self.ema26
         self.signal = ta_trend.EMAIndicator(pd.Series(self.macd), window=self.signal_width).ema_indicator()
@@ -89,8 +92,12 @@ class LiveMACDStrategy:
         if len(self.bars) < 200:  # Need enough data for signals
             return
             
-        # Get current position
+        # Always get fresh position from API
         position = self.get_open_position()
+        if position:
+            logger.info(f"Current position: {position.side} {position.qty} {position.symbol} @ {position.avg_entry_price}")
+        else:
+            logger.info("No current position")
         
         # Entry signals
         if not position:
@@ -101,16 +108,23 @@ class LiveMACDStrategy:
     def check_entry_signals(self):
         """Check for entry opportunities"""
         try:
-            # Check if enough time has passed since last trade
-            if self.last_trade_time and (pd.Timestamp.now() - self.last_trade_time).total_seconds() < self.min_trade_interval:
-                logger.debug(f"Skipping entry - minimum {self.min_trade_interval//3600} hour trade interval not met")
-                return
+            # Remove buy timestamps older than 24 hours
+            current_time = pd.Timestamp.now()
+            self.buy_timestamps = [t for t in self.buy_timestamps
+                                 if (current_time - t).total_seconds() < 24*60*60]
                 
-            # Buy when MACD crosses above signal line, both are below zero, price is above EMA200
+            # Buy when MACD crosses above signal line, both are below offsets, price is above EMA200,
+            # all EMAs are not trending down, and we haven't exceeded max buys in 24h
             if (self.macd.iloc[-1] > self.signal.iloc[-1] and
-                self.macd.iloc[-1] < 0 and
-                self.signal.iloc[-1] < 0 and
-                self.bars['close'].iloc[-1] > self.ema200.iloc[-1]):
+                self.macd.iloc[-1] < self.macd_offset and
+                self.signal.iloc[-1] < self.signal_offset and
+                self.bars['close'].iloc[-1] >= self.ema200.iloc[-1]*1.003 and
+                self.ema12.iloc[-1] >= self.ema12.iloc[-2] and  # EMA12 not trending down
+                self.ema26.iloc[-1] >= self.ema26.iloc[-2] and  # EMA26 not trending down
+                self.emaStop.iloc[-1] >= self.emaStop.iloc[-2] and # emaStop not trending down
+                self.ema200.iloc[-1] >= self.ema200.iloc[-2] and # ema200 not trending down
+                self.signal.iloc[-1] >= self.signal.iloc[-2] and # Signal not trending down
+                len(self.buy_timestamps) < self.max_buy_per_24h):
                 
                 self.enter_position(OrderSide.BUY)
                 self.last_trade_time = pd.Timestamp.now()
@@ -127,17 +141,14 @@ class LiveMACDStrategy:
             if position and position.side == OrderSide.BUY:
                 entry_price = float(position.entry_price)
                 current_price = self.bars['close'].iloc[-1]
-                sl_price = self.emaStop.iloc[-1]
-                tp_price = entry_price + self.risk_reward * (entry_price - sl_price)
+                tp_price = entry_price*1.0055
                 
-                if self.macd.iloc[-1] < self.signal.iloc[-1]:
-                    exit_reason = "MACD crossover below signal"
-                elif current_price < sl_price:
-                    exit_reason = "Stop loss triggered"
-                elif current_price > tp_price:
+                if current_price > tp_price:
                     exit_reason = "Take profit target reached"
+                elif self.macd.iloc[-1] < self.signal.iloc[-1]:
+                    exit_reason = "MACD crossover below signal"
                 elif current_price < self.emaStop.iloc[-1]:
-                    exit_reason = "Price below emaStop"
+                    exit_reason = "emaStop stop loss triggered"
                     
             if exit_reason:
                 self.exit_position(exit_reason)
@@ -176,11 +187,22 @@ class LiveMACDStrategy:
             qty = 0.1  # Fixed position size for example
             required_funds = current_price * qty
             
-            # Check available funds
+            # Check available funds with buffer
             available_funds = self.get_available_funds()
-            if available_funds < required_funds:
+            buffer = 1.05  # 5% buffer for price fluctuations
+            if available_funds < required_funds * buffer:
                 logger.warning(f"Insufficient funds for {side} order (required: {required_funds:.2f}, available: {available_funds:.2f})")
-                return
+                
+                # Try reducing position size if possible
+                min_qty = 0.01  # Minimum trade size
+                adjusted_qty = min(max(available_funds / (current_price * buffer), min_qty), qty)
+                if adjusted_qty >= min_qty:
+                    qty = adjusted_qty
+                    required_funds = current_price * qty
+                    logger.info(f"Reduced position size to {qty:.4f}")
+                else:
+                    logger.warning("Cannot reduce position size further - skipping trade")
+                    return
                 
             order_data = MarketOrderRequest(
                 symbol=self.symbol,
@@ -201,19 +223,39 @@ class LiveMACDStrategy:
         try:
             position = self.get_open_position()
             if position:
+                close_time = pd.Timestamp.now()
+                self.close_timestamps.append(close_time)
                 self.trading_client.close_position(self.symbol)
-                logger.info(f"Exited position: {reason}")
+                logger.info(f"Exited position: {reason} on {close_time.strftime('%m/%d/%Y')}")
                 
         except Exception as e:
             logger.error(f"Error exiting position: {str(e)}")
 
     def get_open_position(self):
-        """Get current open position for the symbol"""
+        """Get current open position for the symbol from Alpaca API"""
         try:
+            # Always fetch fresh position data
             positions = self.trading_client.get_all_positions()
-            if isinstance(positions, list):
-                return next((p for p in positions if hasattr(p, 'symbol') and p.symbol == self.symbol), None)
-            return None
+            if not isinstance(positions, list):
+                return None
+                
+            position = next((p for p in positions
+                          if hasattr(p, 'symbol') and p.symbol == self.symbol.replace('/', '')), None)
+            
+            # Store position details for reference
+            if position:
+                self.current_position = {
+                    'side': position.side,
+                    'qty': position.qty,
+                    'entry_price': position.avg_entry_price,
+                    'current_value': position.market_value,
+                    'timestamp': pd.Timestamp.now()
+                }
+            else:
+                self.current_position = None
+                
+            return position
+            
         except Exception as e:
             logger.error(f"Error getting position: {str(e)}")
             return None
@@ -221,6 +263,13 @@ class LiveMACDStrategy:
     async def run(self):
         """Start live trading"""
         try:
+            # Log initial position status
+            position = self.get_open_position()
+            if position:
+                logger.info(f"Initial position: {position.side} {position.qty} {position.symbol} @ {position.avg_entry_price}")
+            else:
+                logger.info("No initial position found")
+            
             # Initialize data stream with proper credentials
             api_key = os.environ['APCA_API_KEY_ID']
             secret_key = os.environ['APCA_API_SECRET_KEY']
@@ -236,11 +285,14 @@ class LiveMACDStrategy:
             
             # Keep strategy running until 'x' is pressed
             logger.info("Press 'x' to stop trading...")
-            while True:
-                if keyboard.is_pressed('x'):
-                    logger.info("Stopping trading...")
-                    break
-                await asyncio.sleep(0.1)
+            try:
+                while True:
+                    if keyboard.is_pressed('x'):
+                        logger.info("Stopping trading...")
+                        break
+                    await asyncio.sleep(0.1)
+            except KeyboardInterrupt:
+                logger.info("Keyboard interrupt received - stopping trading...")
                 
         except Exception as e:
             logger.error(f"Strategy error: {str(e)}")
