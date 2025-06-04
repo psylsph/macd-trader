@@ -93,7 +93,7 @@ def download_stock_hourly_data(api_key: str,
 
     request_params = StockBarsRequest(
         symbol_or_symbols=symbol.upper(),
-        timeframe=TimeFrame.Hour,
+        timeframe=TimeFrame(1, TimeFrameUnit.Hour),
         start=start_dt,
         end=end_dt,
         adjustment='all'
@@ -117,7 +117,7 @@ def download_crypto_data(api_key: str,
                                 output_file = None):
     """Downloads 1-hour historical crypto data from Alpaca."""
     client = CryptoHistoricalDataClient(api_key, secret_key)
-    print(f"Fetching 1-hour CRYPTO data for {symbol} from {start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
+    print(f"Fetching {time_frame} CRYPTO data for {symbol} from {start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} to {end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}...")
 
     # Crypto symbols are often pairs like "BTC/USD". The API expects them as is.
     request_params = CryptoBarsRequest(

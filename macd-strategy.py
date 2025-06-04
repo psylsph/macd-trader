@@ -1,4 +1,3 @@
-from ast import And
 import pandas as pd
 import backtrader as bt
 import warnings
@@ -20,6 +19,8 @@ class MACDStrategy(bt.Strategy):
         ('macd_signal', 9))
 
     def __init__(self):
+        """Initialize strategy components."""
+        print("\nInitializing strategy indicators...")
 
         self.signals = None
         self.order = None
@@ -67,20 +68,20 @@ class MACDStrategy(bt.Strategy):
 
     def next(self):
         # Get current datetime
-        current_dt = self.data.datetime.datetime(-1)
-        current_close = self.dataclose[-1]
+        current_dt = self.data.datetime.datetime(0)
+        current_close = self.dataclose[0]
         self.bar_count += 1  # Increment bar counter
 
         # Check if we're still in cooldown period
         bars_since_last_sell = self.bar_count - self.last_sell_bar
         
         if (not self.position and
-            self.ema_fast[-1] > self.ema_slow[-1] and
-            #self.macd_line[-1] < 0 and
-            self.dataclose[-1] > self.ema200[-1] and
-            self.ema_slow[-2] < self.ema_slow[-1] and
-            self.ema_fast[-2] < self.ema_fast[-1] and
-            self.ema200[-2] < self.ema200[-1]
+            self.ema_fast[0] > self.ema_slow[0] and
+            #self.macd_line[0] < 0 and
+            self.dataclose[0] > self.ema200[0] and
+            self.ema_slow[-1] < self.ema_slow[0] and
+            self.ema_fast[-1] < self.ema_fast[0] and
+            self.ema200[-1] < self.ema200[0]
         ):
 
             if DEBUG:
@@ -94,7 +95,7 @@ class MACDStrategy(bt.Strategy):
             self.buy_signals.append((current_dt, current_close))
             self.buy_timestamps.append(current_dt)
             self.position_openings.append((current_dt, current_close, 'long'))
-            #self.buy(size=0.5, sl=self.dataclose[-1] - 2*self.atr[-1])
+            #self.buy(size=0.5, sl=self.dataclose[0] - 2*self.atr[0])
             self.buy(size=0.5, sl=current_close)
             
         # Only proceed with position closing logic if we actually have an open position
@@ -105,15 +106,15 @@ class MACDStrategy(bt.Strategy):
             if self.position:
                 entry_price = self.position.price
                 tp_price = entry_price*1.05
-                if self.dataclose[-1] > tp_price:
+                if self.dataclose[0] > tp_price:
                     exit_reason = "Take profit target reached"
-                elif self.ema_fast[-1] < self.ema_slow[-1]:  # Fast below Slow
+                elif self.ema_fast[0] < self.ema_slow[0]:  # Fast below Slow
                     exit_reason = "Fast below Slow"
                     self.last_sell_bar = self.bar_count  # Record the sell bar
-                elif self.dataclose[-1] < self.ema200[-1]:  # Stop loss
+                elif self.dataclose[0] < self.ema200[0]:  # Stop loss
                     exit_reason = "ema200 stop loss triggered"
                     self.last_sell_bar = self.bar_count  # Record the sell bar
-                elif self.ema_fast[-2] > self.ema_fast[-1]:  # Fast above Fast
+                elif self.ema_fast[-1] > self.ema_fast[0]:  # Fast above Fast
                     exit_reason = "Fast dropping"
                     self.last_sell_bar = self.bar_count
            
@@ -123,8 +124,8 @@ class MACDStrategy(bt.Strategy):
                     if DEBUG:
                         print(">>> SELL SIGNAL TRIGGERED <<<")
                         print(f"Processing bar at {current_dt}: Close={current_close:.2f}")
-                        print(f"CLOSING POSITION: {exit_reason} on {self.data.datetime.datetime(-1).strftime('%m/%d/%Y')}")
-                        print(f"Exit Price: {self.dataclose[-1]:.2f}")
+                        print(f"CLOSING POSITION: {exit_reason} on {self.data.datetime.datetime(0).strftime('%m/%d/%Y')}")
+                        print(f"Exit Price: {self.dataclose[0]:.2f}")
                     self.sell_signals.append((current_dt, current_close))
                     if DEBUG:
                         print(f"Starting cooldown period of {self.p.cooldown_bars} bars")
@@ -133,8 +134,9 @@ def stop(self):
         # Close any open position at the end of the backtest
         if self.position:
             if DEBUG:
-                print("Closing last open position at end of backtest")
-            self.close()
+                print(f"\nClosing final position at {self.current_dt}")
+                print(f"Final Close: ${self.current_close:.2f}")
+            self.close(exectype=bt.Order.Market)
 
 if __name__ == "__main__":
     
@@ -179,9 +181,11 @@ if __name__ == "__main__":
     print(f"\nStarting Backtest:")
     print(f"Initial Portfolio Value: ${initial_value:.2f}")
     
+    # Run backtest
     try:
         results = cerebro.run()
         
+        # Calculate returns
         final_value = cerebro.broker.getvalue()
         abs_return = final_value - initial_value
         pct_return = (abs_return / initial_value) * 100
@@ -194,10 +198,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nBacktest failed: {str(e)}")
         raise
-    final_value = cerebro.broker.get_value()
-    print(f"Final Portfolio Value: {final_value}")
 
     # Plot the results (including buy/sell signals and portfolio changes)
     cerebro.plot(style='candlestick')
-
-
